@@ -27,6 +27,11 @@
 #include "ao_coreaudio_properties.h"
 #include "ao_coreaudio_utils.h"
 
+// The timeout for stopping the audio unit after being reset. This allows the
+// device to sleep after playback paused. The duration is chosen to match the
+// behavior of AVFoundation.
+#define IDLE_TIME 7 * NSEC_PER_SEC
+
 struct priv {
     AudioDeviceID device;
     AudioUnit audio_unit;
@@ -37,6 +42,10 @@ struct priv {
     AudioStreamID original_asbd_stream;
 
     bool change_physical_format;
+
+    // Block that is executed after `IDLE_TIME` to stop audio output unit.
+    dispatch_block_t idle_work;
+    dispatch_queue_t queue;
 };
 
 static int64_t ca_get_hardware_latency(struct ao *ao) {
@@ -158,6 +167,9 @@ static int init(struct ao *ao)
 
     if (!init_audiounit(ao, asbd))
         goto coreaudio_error;
+
+    p->queue = dispatch_queue_create("io.mpv.coreaudio_stop_during_idle",
+                                     DISPATCH_QUEUE_SERIAL);
 
     return CONTROL_OK;
 
@@ -313,24 +325,65 @@ coreaudio_error:
     return false;
 }
 
+static void stop(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+    OSStatus err = AudioOutputUnitStop(p->audio_unit);
+    CHECK_CA_WARN("can't stop audio unit");
+}
+
+static void cancel_and_release_idle_work(struct priv *p)
+{
+    if (!p->idle_work)
+        return;
+
+    dispatch_block_cancel(p->idle_work);
+    Block_release(p->idle_work);
+    p->idle_work = NULL;
+}
+
+static void stop_after_idle_time(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+
+    cancel_and_release_idle_work(p);
+
+    p->idle_work = dispatch_block_create(0, ^{
+        MP_VERBOSE(ao, "Stopping audio unit due to idle timeout\n");
+        stop(ao);
+    });
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, IDLE_TIME),
+                   p->queue, p->idle_work);
+}
+
 static void reset(struct ao *ao)
 {
     struct priv *p = ao->priv;
     OSStatus err = AudioUnitReset(p->audio_unit, kAudioUnitScope_Global, 0);
     CHECK_CA_WARN("can't reset audio unit");
+
+    stop_after_idle_time(ao);
 }
 
 static void start(struct ao *ao)
 {
     struct priv *p = ao->priv;
+
+    if (p->idle_work)
+        dispatch_block_cancel(p->idle_work);
+
     OSStatus err = AudioOutputUnitStart(p->audio_unit);
     CHECK_CA_WARN("can't start audio unit");
 }
 
-
 static void uninit(struct ao *ao)
 {
     struct priv *p = ao->priv;
+
+    cancel_and_release_idle_work(p);
+    dispatch_release(p->queue);
+
     AudioOutputUnitStop(p->audio_unit);
     AudioUnitUninitialize(p->audio_unit);
     AudioComponentInstanceDispose(p->audio_unit);
